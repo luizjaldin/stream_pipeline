@@ -1,43 +1,107 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sum, window
-from pyspark.sql.streaming import Trigger
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType
+import datetime
+import os
 
-# Criar uma sessão Spark
-spark = SparkSession.builder \
-    .appName("StreamingPipeline") \
-    .master("local[2]") \
-    .getOrCreate()
+class StreamingPipeline:
 
-# Definir a fonte de dados (pode ser alterado para a fonte desejada)
-data_source = "path/to/your/json/data"
+    def __init__(self):
+        self.kafka_bootstrap_servers = 'localhost:9092'
+        self.kafka_topic = 'topic_streaming_data'
+        self.output_path = os.getcwd().split('stream_pipeline')[0] + "stream_pipeline/output/topic_streaming_data/data_eletronicos_kpi"
+        self.checkpoint_path = os.getcwd().split('stream_pipeline')[0] + "stream_pipeline/checkpoint_path/topic_streaming_data/data_eletronicos_kpi"
 
-# Ler os dados de streaming a partir da fonte
-streaming_df = spark.readStream \
-    .format("json") \
-    .option("maxFilesPerTrigger", 1) \
-    .json(data_source)
+    def get_spark_session(self):
+        
+        os.environ["JAVA_HOME"] = "/usr/local/opt/openjdk@11"
 
-# Bônus 1: Adicionar uma etapa de filtro
-filtered_df = streaming_df.filter(col("your_column") > 10)
+        spark = SparkSession.builder \
+                .config("spark.driver.host", "localhost") \
+                .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0") \
+                .appName("StreamingPipeline") \
+                .master("local[2]") \
+                .getOrCreate()
+        return spark
 
-# Bônus 2: Adicionar uma etapa de agregação
-aggregated_df = filtered_df.groupBy("your_grouping_column").agg(sum("your_aggregation_column").alias("total"))
+    def read_kafka(self, spark):
+        streaming_df = spark.readStream \
+                            .format("kafka") \
+                            .option("kafka.bootstrap.servers", self.kafka_bootstrap_servers) \
+                            .option("subscribe", self.kafka_topic) \
+                            .option("startingOffsets", "earliest") \
+                            .option("failOnDataLoss", "false") \
+                            .load()
+        
+        json_schema = StructType([
+                        StructField('vendedor', StructType([
+                            StructField('nome', StringType()),
+                            StructField('codigo', StringType()),
+                            StructField('filial', StringType())
+                        ])),
+                        StructField('filial', StructType([
+                            StructField('nome', StringType()),
+                            StructField('estado', StringType()),
+                            StructField('cidade', StringType())
+                        ])),
+                        StructField('produto', StructType([
+                            StructField('codigo', StringType()),
+                            StructField('nome', StringType()),
+                            StructField('preço', DoubleType()),
+                            StructField('categoria', StringType()),
+                            StructField('cor', StringType())
+                        ])),
+                        StructField('quantidade', IntegerType()),
+                        StructField('ordem_id', IntegerType()),
+                        StructField('timestamp', StringType())
+                    ])
+        
+        streaming_df = streaming_df.withColumn("value", F.decode(F.col("value"), 'UTF-8'))
+        streaming_df = streaming_df.select(F.from_json(F.col('value').cast('string'), json_schema).alias('data'),'timestamp')
+        streaming_df = streaming_df.withColumn("timestamp_venda", F.from_unixtime("data.timestamp"))
 
-# Bônus 3: Utilizar a função Window para agregar dados em janelas de tempo
-windowed_df = filtered_df \
-    .groupBy(window(col("timestamp_column"), "10 minutes"), col("your_grouping_column")) \
-    .agg(sum("your_aggregation_column").alias("total"))
+        filter_df = streaming_df.filter(F.col("data.produto.categoria") == 'Eletrônicos')\
+                                .select(
+                                    'data.produto.nome',
+                                    'data.produto.preço',
+                                    'data.quantidade',
+                                    'data.filial.nome',
+                                    'data.filial.cidade',
+                                    'data.ordem_id',
+                                    'timestamp'
+                                )
 
-# Definir a saída (pode ser alterado para o formato desejado, como Parquet)
-output_path = "path/to/your/output"
+        return filter_df
 
-# Iniciar o streaming e escrever os resultados
-query = windowed_df.writeStream \
-    .outputMode("complete") \
-    .format("parquet") \
-    .option("path", output_path) \
-    .trigger(Trigger.ProcessingTime("1 minute")) \
-    .start()
+    def calcular_metricas(self, df):
+        aggregated_df = df.withWatermark("timestamp", "10 minutes")\
+                        .groupBy(F.window(F.col("timestamp"), "10 minutes"),"cidade").agg(F.sum( 
+                                                                F.col("preço")*F.col("quantidade")
+                                                                ).alias("total"),
+                                                                F.sum("quantidade").alias("quantidade_vendida"),
+                            )
 
-# Aguardar a conclusão do streaming
-query.awaitTermination()
+        aggregated_df = aggregated_df.withColumn("valor_medio_de_venda", F.col("total")/F.col("quantidade_vendida"))
+        return aggregated_df
+    
+    def save_data(df, self):
+        df = df.withColumn("year", F.year(F.col("window.start")))
+        df = df.withColumn("month",F.month(F.col("window.start")))
+        df = df.withColumn("day", F.dayofmonth(F.col("window.start")))
+        df = df.withColumn("hour", F.hour(F.col("window.start")))
+
+        query = df.writeStream \
+                            .outputMode("append") \
+                            .format("parquet") \
+                            .option("path", self.output_path) \
+                            .option("checkpointLocation", self.checkpoint_path) \
+                            .partitionBy("year", "month", "day", "hour") \
+                            .trigger(processingTime='10 minute') \
+                            .start()
+
+    def run(self):
+        spark = self.get_spark_session()
+        while True:
+            df = self.read_kafka(spark, self)
+            df = self.calcular_metricas(df)
+            self.save_data(df)

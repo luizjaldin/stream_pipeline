@@ -1,0 +1,2 @@
+v1
+{"path":"file:///Users/luiz.oliveira/eng_data/stream_pipeline/output/topic_streaming_data/data_25/year=2024/month=1/day=4/hour=16/part-00000-af2a7098-49be-40de-8b5c-c23a7a4deddf.c000.snappy.parquet","size":7030,"isDir":false,"modificationTime":1704396061377,"blockReplication":1,"blockSize":33554432,"action":"add"}
