@@ -1,5 +1,6 @@
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
+from pyspark.sql import DataFrame
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType
 import datetime
 import os
@@ -84,7 +85,7 @@ class StreamingPipeline:
         aggregated_df = aggregated_df.withColumn("valor_medio_de_venda", F.col("total")/F.col("quantidade_vendida"))
         return aggregated_df
     
-    def save_data(df, self):
+    def save_data(self, df: DataFrame):
         df = df.withColumn("year", F.year(F.col("window.start")))
         df = df.withColumn("month",F.month(F.col("window.start")))
         df = df.withColumn("day", F.dayofmonth(F.col("window.start")))
@@ -96,12 +97,17 @@ class StreamingPipeline:
                             .option("path", self.output_path) \
                             .option("checkpointLocation", self.checkpoint_path) \
                             .partitionBy("year", "month", "day", "hour") \
-                            .trigger(processingTime='10 minute') \
+                            .trigger(processingTime='1 minute') \
                             .start()
 
     def run(self):
         spark = self.get_spark_session()
-        while True:
-            df = self.read_kafka(spark, self)
-            df = self.calcular_metricas(df)
-            self.save_data(df)
+        df = self.calcular_metricas(self.read_kafka(spark))
+        self.save_data(df)
+
+        # Aguarde a conclusão do streaming (interrompa manualmente com Ctrl+C)
+        try:
+            spark.streams.awaitAnyTermination()
+        except KeyboardInterrupt:
+            print("Parando o streaming manualmente.")
+            spark.stop()
